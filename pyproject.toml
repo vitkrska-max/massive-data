@@ -1,0 +1,43 @@
+# Závislosti projektu massive_data.py.
+# Prostředí se staví příkazem:
+#   uv venv venv
+#   UV_PROJECT_ENVIRONMENT=venv uv add <balicek>
+# a celé prostředí se pak srovná podle pyproject.toml a uv.lock:
+#   UV_PROJECT_ENVIRONMENT=venv uv sync
+
+[project]
+# Název NESMÍ být "massive" -- kolidoval by s PyPI balíčkem massive,
+# na kterém projekt závisí (uv by hlásil, že projekt závisí sám na sobě).
+name = "massive-data"
+version = "0.1.0"
+description = "Stahování OHLCV dat z Massive (dříve Polygon.io) do lokálního parquet úložiště."
+requires-python = ">=3.13"
+
+dependencies = [
+    # Konfigurace: load_config() v massive_data.py.
+    "pyyaml==6.0.3",
+
+    # relativedelta pro _REST_HISTORY_MONTHS a _MINUTE_CHUNK_DAYS.
+    # Pin <3.0.0 je nutný: kdyby ho uv vyřešil jako 3.0.0 (PyPI ho nabízí
+    # jako latest), botocore 1.x ho odmítne a uv při backtracingu spadne
+    # až k boto3==0.0.3 z roku 2015 -- a přesto hlásí úspěch.
+    "python-dateutil==2.9.0.post0",
+
+    # csv -> parquet (flat files) i odesílání barů do parquet (REST cesty).
+    "pyarrow==26.0.0",
+
+    # REST klient -- update_daily a update_minute.
+    "massive==2.9.1",
+
+    # S3 flat files -- update_flat_files.
+    "boto3==1.43.123",
+
+    # Nepsat jako nepřímou závislost: dateutil si vystačí se "six>=1.15",
+    # takže uv klidně nechá stát rozbitou 1.7.3, které chybí six.moves.
+    "six>=1.17.0",
+]
+
+# massive_data.py je samostatný skript v kořeni, ne instalovatelný balíček.
+# Bez tohohle by se uv sync snažil "nainstalovat" i samotný projekt.
+[tool.uv]
+package = false

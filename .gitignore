@@ -11,6 +11,9 @@ __pycache__/
 *.py[cod]
 *.log
 
+# Lokální virtualenv spravovaný uv (uv venv venv).
+venv/
+
 # Dočasné adresáře testů a smoke-testu.
 # Testy si je samy vytvářejí a uklízejí (_test_flat_root, _test_minute_dir,
 # _test_real_root_m, _smoke_root, …), ale po pádu zůstanou ležet.
