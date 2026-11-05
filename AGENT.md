@@ -17,6 +17,7 @@ python _test_daily.py                            # offline, fake massive
 python _test_minute.py                           # offline, fake massive
 python _test_real_client.py                      # offline, PRAVÁ knihovna massive
 python _smoke_real_api.py [both|daily|minute]    # ŽIVĚ — spotřebuje API kvótu
+python convert_ohlc_daily.py                     # jednorázově: /trading/ohlc -> měsíční parquet (offline)
 git push                                         # záloha na GitHub (origin)
 ```
 
