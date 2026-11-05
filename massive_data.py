@@ -42,14 +42,46 @@ def _is_placeholder(value) -> bool:
 # Logging
 # ---------------------------------------------------------------------------
 
-def setup_logging() -> logging.Logger:
-    """Nastaví logging a vrátí logger pro volající modul."""
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+_LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
+# Název log souboru v adresáři, který dostane setup_logging(log_dir).
+_LOG_FILE_NAME = "massive_data.log"
+
+
+def setup_logging(log_dir: Path | None = None) -> logging.Logger:
+    """Nastaví logging a vrátí logger pro volající modul.
+
+    Zprávy jdou vždy na stdout. Pokud je zadán `log_dir`, přidá se navíc
+    FileHandler do {log_dir}/{_LOG_FILE_NAME} (UTF-8) — volá se po načtení
+    konfigurace, protože teprve tehdy je známý root_folder. Opakované volání
+    se stejným adresářem handler neduplikuje.
+
+    Log soubor není rotovaný: při týdenním spouštění naroste pomalu, a kdyby
+    to vadilo, stačí ho smazat — nový se vytvoří při dalším běhu.
+    """
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        format=_LOG_FORMAT,
+        datefmt=_LOG_DATEFMT,
     )
-    return logging.getLogger(__name__)
+    logger = logging.getLogger(__name__)
+
+    if log_dir is not None:
+        root = logging.getLogger()
+        path = (Path(log_dir) / _LOG_FILE_NAME).resolve()
+        already = any(
+            isinstance(handler, logging.FileHandler)
+            and Path(handler.baseFilename) == path
+            for handler in root.handlers
+        )
+        if not already:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handler = logging.FileHandler(path, encoding="utf-8")
+            handler.setFormatter(logging.Formatter(_LOG_FORMAT, _LOG_DATEFMT))
+            root.addHandler(handler)
+            logger.info("Logy se zapisují také do %s", path)
+
+    return logger
 
 
 log = setup_logging()
@@ -800,6 +832,8 @@ def update_minute(cfg: AppConfig) -> None:
 
 if __name__ == "__main__":
     cfg = load_config()
+    # Teprve teď je známý root_folder — odsud se loguje i do [root_folder]/logs.
+    setup_logging(cfg.root_folder / "logs")
     update_flat_files(cfg, timeframe="1D")
     update_flat_files(cfg, timeframe="1m")
     # Při subscription=False výše uvedené funkce nic nestahují a denní data

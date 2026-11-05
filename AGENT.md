@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENT.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to coding agents (Claude Code, Codex, Hermes) when working with code in this repository.
 
 ## Projekt
 
@@ -52,7 +52,7 @@ Nesjednocovat bez dotazu — jsou to vědomá rozhodnutí uživatele:
 - **`timeframe` je `1m`, ne `1min`** jak říká spec.
 - **Seznam tickerů je napevno** `1m_{market}.txt` v `REPO_ROOT`, ne z konfiguračního klíče `tikers_file`. Soubory už v adresáři existují (stocks 12 615, crypto 625, fx 1 208).
 - **Hloubka historie pro REST** je 23 měsíců (`_REST_HISTORY_MONTHS`) u `update_daily`, ale jen 31 dní (`_MINUTE_CHUNK_DAYS`) u `update_minute`. Spec zmiňuje 1 měsíc; `history_months` z config.yaml platí **jen pro flat files**.
-- **`reference.db` a `tickers.sqlite` z `MASSIVE.md` nejsou implementované.** SQLite část specu je zatím jen návrh, v kódu po ní není ani zmínka.
+- **`reference.db` a `tickers.sqlite` z `MASSIVE.md` nejsou implementované.** SQLite část specu je zatím jen návrh. Pozůstatek staré implementace je `me_ticker_info.py` — importuje neexistující moduly (`config`, `me_common`) a čte pole, která v `AppConfig` nejsou (např. `cfg.db_path`), takže se nespustí; slouží jen jako zdroj pro budoucí SQLite část a je v `.gitignore`.
 - `FLAT_FILES_BUCKET = "files.massive.com"` je **neověřený odhad** — v kódu označený `# TODO`. Knihovna `massive` flat files vůbec neobsahuje (je čistě REST), takže to z ní ověřit nelze.
 
 ## Zrádná místa
@@ -65,8 +65,8 @@ Nesjednocovat bez dotazu — jsou to vědomá rozhodnutí uživatele:
 
 **`pagination=True` je default knihovny `massive`.** Jedno volání `list_aggs` tak může udělat víc HTTP dotazů (přes `next_url`), což rozbíjí počítání rate limitu. Drží to pod kontrolou až dělení na 31denní úseky (`_MINUTE_CHUNK_DAYS`) — jeden úsek zůstane pod limitem 50 000 záznamů na stránku.
 
-**Do log zpráv nepiš non-ASCII znaky** (např. `→`). Vývojový stroj má konzoli cp1250 a logy se rozsypou; v kódu je proto `->`.
+**Logy jdou na stdout a do souboru.** `setup_logging()` na importu nastaví jen konzoli; `__main__` ho volá znovu s `cfg.root_folder / "logs"`, což přidá `FileHandler` do `[root_folder]/logs/massive_data.log` (UTF-8, bez rotace, opakované volání handler neduplikuje). Běží na Linuxu s UTF-8 — diakritika ani `—` v log zprávách nevadí, žádné ASCII omezení tu není.
 
 **`update_minute` není v `__main__`** — je pomalá (12,5 s na ticker) a běží se ručně. `_REST_DELAY_SECONDS = 12.5` je napevno v kódu, v `config.yaml` klíč pro prodlevu není.
 
-**Repozitář je pod gitem** (od 2026-09-12), `origin` míří na https://github.com/vitkrska-max/massive, který je **veřejný**. `secrets.yaml` a `.claude/settings.local.json` proto musí zůstat v `.gitignore` — před každým commitem zkontroluj `git status`, že se tam nedostaly. Commit identita je nastavená jen lokálně pro tento repozitář (`vitkrska-max` + GitHub noreply adresa), globální `~/.gitconfig` zůstal nedotčený.
+**Repozitář je pod gitem** (od 2026-09-12), `origin` míří na https://github.com/vitkrska-max/massive-data, který je **veřejný**. `secrets.yaml` a `.claude/settings.local.json` proto musí zůstat v `.gitignore` — před každým commitem zkontroluj `git status`, že se tam nedostaly. Commit identita je nastavená jen lokálně pro tento repozitář (`vitkrska-max` + GitHub noreply adresa), globální `~/.gitconfig` zůstal nedotčený.

@@ -24,6 +24,11 @@ _smoke_*/
 # Záloha smazaných legacy souborů me_*.py — lokální síť, ne obsah projektu.
 _legacy_me.zip
 
+# me_ticker_info.py je pozůstatek staré implementace (importuje neexistující
+# config/me_common). Nechává se lokálně jako zdroj pro budoucí SQLite část
+# (reference.db), do repa nepatří.
+me_ticker_info.py
+
 # POZOR: 1m_stocks.txt, 1m_crypto.txt a 1m_fx.txt se záměrně NEignorují.
 # Je to vstup, který kód potřebuje (update_minute je čte) a v tomto repozitáři
 # ho není z čeho vygenerovat — bez nich by projekt nešel spustit.
