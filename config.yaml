@@ -22,15 +22,15 @@ history_months: 120
 # Seznam trhů, které se mají stahovat.
 markets:
   - "stocks"
-#  - "crypto"
-#  - "fx"
+  - "crypto"
+  - "fx"
 
 # --- Adresář lokálního úložiště ---
 # Adresář pro logy[root_folder]/logs
 # FlatFiles: [root_folder]/flat_files/{market}/{timeframe}/{year}/{month}/{date}.csv.gz
 # Parquet[root_folder]/{market}/{timeframe}/{year}/{month}/{date}.parquet
 # Ostatní data: [root_folder]/{market}/reference.db
-root_folder: "/home/vitek/trading_data/massive"
+root_folder: "/home/vitek/trading/data"
 
 # --- Opakování dotazů v případě chyb ---
 # Kolikrát se má opakovat dotaz v případě chyby.
