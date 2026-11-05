@@ -38,8 +38,9 @@ Konfigurace: `load_config()` čte `config.yaml` (povinný) + `secrets.yaml` (nep
 
 Načtení secretu se děje **až v místě použití** přes `cfg.require_secret("api_key")`, ne při načtení konfigurace.
 
-**Navazování na předchozí běh** se odvozuje z názvů souborů, žádný progress soubor neexistuje:
-- `update_daily` / `update_minute` → `last_downloaded_date(cfg, market, timeframe)` (modulová funkce)
+**Navazování na předchozí běh** se odvozuje z uložených dat, žádný progress soubor neexistuje:
+- `update_minute` → `last_downloaded_date(cfg, market, timeframe)` (modulová funkce, pozná den z ISO názvů denních souborů)
+- `update_daily` → vlastní vnořená `_last_downloaded_day(market)`: názvy měsíčních souborů datum neobsahují, takže bere maximum `window_start` z nejnovějšího `month=??.parquet`
 - `update_flat_files` → vlastní vnořená `_last_downloaded_date(dest_dir)`, čte názvy csv.gz
 
 **Schéma parquet je u obou cest stejné** — `ticker, window_start, open, high, low, close, volume, transactions, vwap`. `window_start` je Unix **nanosekundy** (flat files je tak mají; REST vrací milisekundy, proto `bar.timestamp * 1_000_000`). Sortuje se podle `ticker` a uvnitř podle `window_start`, aby se row groups shlukly po tickerech.
@@ -48,7 +49,7 @@ Načtení secretu se děje **až v místě použití** přes `cfg.require_secret
 
 Nesjednocovat bez dotazu — jsou to vědomá rozhodnutí uživatele:
 
-- **Dvě různé adresářové struktury.** `update_flat_files` píše `root_folder/{market}/timeframe={tf}/…` (market **bez** `=`), REST cesty píší `root_folder/market={market}/timeframe={tf}/…` (market **s** `=`). Není to bug.
+- **Dvě různé adresářové struktury.** `update_flat_files` píše `root_folder/{market}/timeframe={tf}/…` (market **bez** `=`), REST cesty píší `root_folder/market={market}/timeframe={tf}/…` (market **s** `=`). Není to bug. Navíc `update_daily` ukládá **po měsících** (`year={YYYY}/month={MM}.parquet`, den je jen v `window_start`), zatímco `update_minute` a flat files zůstávají po dnech (`month={MM}/{date}.parquet`).
 - **`timeframe` je `1m`, ne `1min`** jak říká spec.
 - **Seznam tickerů je napevno** `1m_{market}.txt` v `REPO_ROOT`, ne z konfiguračního klíče `tikers_file`. Soubory už v adresáři existují (stocks 12 615, crypto 625, fx 1 208).
 - **Hloubka historie pro REST** je 23 měsíců (`_REST_HISTORY_MONTHS`) u `update_daily`, ale jen 31 dní (`_MINUTE_CHUNK_DAYS`) u `update_minute`. Spec zmiňuje 1 měsíc; `history_months` z config.yaml platí **jen pro flat files**.
@@ -66,6 +67,8 @@ Nesjednocovat bez dotazu — jsou to vědomá rozhodnutí uživatele:
 **`pagination=True` je default knihovny `massive`.** Jedno volání `list_aggs` tak může udělat víc HTTP dotazů (přes `next_url`), což rozbíjí počítání rate limitu. Drží to pod kontrolou až dělení na 31denní úseky (`_MINUTE_CHUNK_DAYS`) — jeden úsek zůstane pod limitem 50 000 záznamů na stránku.
 
 **Logy jdou na stdout a do souboru.** `setup_logging()` na importu nastaví jen konzoli; `__main__` ho volá znovu s `cfg.root_folder / "logs"`, což přidá `FileHandler` do `[root_folder]/logs/massive_data.log` (UTF-8, bez rotace, opakované volání handler neduplikuje). Běží na Linuxu s UTF-8 — diakritika ani `—` v log zprávách nevadí, žádné ASCII omezení tu není.
+
+**Měsíční soubor se nikdy neappenduje.** `_save_month` načte existující parquet, přidá nové dny přes `concat_tables`, setřídí a zapíše přes `*.tmp` + `Path.replace()`. Deduplikace tam není — nepotřebná, protože se začíná až za `max(window_start)`; ruční zásah do souboru ji ale obejde. Buffer drží nejvýš jeden měsíc, takže ani 23měsíční naplnění nesežere paměť.
 
 **`update_minute` není v `__main__`** — je pomalá (12,5 s na ticker) a běží se ručně. `_REST_DELAY_SECONDS = 12.5` je napevno v kódu, v `config.yaml` klíč pro prodlevu není.
 

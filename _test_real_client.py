@@ -50,11 +50,14 @@ class RecordingClient(massive.RESTClient):
     def _get(self, path, params=None, result_key=None, deserializer=None,
              raw=False, options=None):
         CALLS.append(("grouped", path, dict(params or {})))
+        # Den bereme z URL — jinak by všechny dotazy vracely bary jednoho dne
+        # a v měsíčním souboru by vznikly duplicity.
+        requested = date.fromisoformat(path.rsplit("/", 1)[-1])
         rows = [
             {"T": "AAPL", "o": 10.0, "h": 11.0, "l": 9.0, "c": 10.5,
-             "v": 1000, "vw": 10.4, "t": _ms(DAY), "n": 42},
+             "v": 1000, "vw": 10.4, "t": _ms(requested), "n": 42},
             {"T": "MSFT", "o": 20.0, "h": 21.0, "l": 19.0, "c": 20.5,
-             "v": 2000, "vw": 20.4, "t": _ms(DAY), "n": 84},
+             "v": 2000, "vw": 20.4, "t": _ms(requested), "n": 84},
         ]
         return [deserializer(r) for r in rows]
 
@@ -80,41 +83,73 @@ def cfg_for(root):
 
 
 def seed_last_day(root, market, day):
-    """Předstírá, že poslední stažený den je `day` — zkrátí rozsah stahování."""
-    path = (root / f"market={market}" / "timeframe=1D"
-            / f"year={day.year}" / f"month={day.month:02d}"
-            / f"{day.isoformat()}.parquet")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"")
+    """Předstírá, že poslední stažený den je `day` — zkrátí rozsah stahování.
 
+    `update_daily` odvozuje poslední den z max(window_start) měsíčního
+    souboru, takže se seeduje opravdový řádek, ne prázdný soubor.
+    """
+    import pyarrow as pa
+
+    path = (root / f"market={market}" / "timeframe=1D"
+            / f"year={day.year}" / f"month={day.month:02d}.parquet")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    table = pa.Table.from_pylist([{
+        "ticker": "SEED",
+        "window_start": _ms(day) * 1_000_000,
+        "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+        "volume": 1, "transactions": 1, "vwap": 1.0,
+    }])
+    pq.write_table(table, path, compression="zstd")
+
+
+def all_rows(root):
+    """Všechny řádky ze všech parquet souborů trhu."""
+    rows = []
+    for path in sorted((root / "market=stocks" / "timeframe=1D").rglob("*.parquet")):
+        rows.extend(pq.read_table(path).to_pylist())
+    return rows
+
+
+SEED_DAY = DAY - timedelta(days=1)
+while SEED_DAY.weekday() >= 5:        # ať je seed pracovní den
+    SEED_DAY -= timedelta(days=1)
+expected_days = [
+    d for d in (SEED_DAY + timedelta(days=i)
+                for i in range(1, (END - SEED_DAY).days + 1))
+    if d.weekday() < 5
+]
 
 # --- 1) update_daily: URL a parametry dotazu na celý trh ------------------
-seed_last_day(ROOT, "stocks", TODAY - timedelta(days=3))
+seed_last_day(ROOT, "stocks", SEED_DAY)
 md.update_daily(cfg_for(ROOT))
 
 grouped = [c for c in CALLS if c[0] == "grouped"]
-assert len(grouped) == 2, f"měly být 2 dotazy (2 dny): {grouped}"
+assert len(grouped) == len(expected_days), \
+    f"mělo být {len(expected_days)} dotazů, bylo {len(grouped)}"
 kind, path, params = grouped[0]
-assert path == f"/v2/aggs/grouped/locale/us/market/stocks/{DAY.isoformat()}", path
+assert path == f"/v2/aggs/grouped/locale/us/market/stocks/{expected_days[0].isoformat()}", path
 assert params.get("adjusted") == "true", params
 assert "from" not in params and "to" not in params, params
 print(f"update_daily -> {path} {params}")
 
-# --- 2) update_daily: data se dostala do parquet se správnými hodnotami ---
+# --- 2) update_daily: data se dostala do měsíčního parquet se správnými hodnotami
 dest = ROOT / "market=stocks" / "timeframe=1D" / f"year={DAY.year}" \
-    / f"month={DAY.month:02d}" / f"{DAY.isoformat()}.parquet"
+    / f"month={DAY.month:02d}.parquet"
 assert dest.exists(), f"chybí {dest}"
 with pq.ParquetFile(dest) as pf:
     assert pf.metadata.row_group(0).column(0).compression == "ZSTD"
-    t = pf.read()
-assert t.column("ticker").to_pylist() == ["AAPL", "MSFT"], t.column("ticker").to_pylist()
-assert t.column("close").to_pylist() == [10.5, 20.5], t.column("close").to_pylist()
-assert t.column("transactions").to_pylist() == [42, 84], t.column("transactions").to_pylist()
-assert t.column("vwap").to_pylist() == [10.4, 20.4], t.column("vwap").to_pylist()
+
+rows = [r for r in pq.read_table(dest).to_pylist()
+        if r["window_start"] == _ms(DAY) * 1_000_000]
+assert [r["ticker"] for r in rows] == ["AAPL", "MSFT"], rows
+assert [r["close"] for r in rows] == [10.5, 20.5], rows
+assert [r["transactions"] for r in rows] == [42, 84], rows
+assert [r["vwap"] for r in rows] == [10.4, 20.4], rows
 # bar.timestamp je v ms, do parquet jde v ns (jako flat soubory)
-assert t.column("window_start").to_pylist() == [_ms(DAY) * 1_000_000] * 2, \
-    t.column("window_start").to_pylist()
-print("update_daily: hodnoty, zstd a ns window_start: OK")
+assert all(r["window_start"] % 1_000_000_000 == 0 for r in rows), rows
+# merge nesmí zahodit dřív uložený den
+assert any(r["ticker"] == "SEED" for r in all_rows(ROOT)), "seed řádek zmizel"
+print("update_daily: hodnoty, zstd, ns window_start a merge: OK")
 
 # --- 3) update_minute: URL a parametry dotazu na ticker -------------------
 TICKER_DIR.joinpath("1m_stocks.txt").write_text("# test\nAAPL\n", encoding="utf-8")

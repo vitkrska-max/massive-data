@@ -430,28 +430,57 @@ def update_daily(cfg: AppConfig) -> None:
     jako flat soubory (viz update_flat_files).
 
     Pro každý trh z cfg.markets:
-    1. Zjistí poslední stažené datum z
-       [root_folder]/market=?/timeframe=1D/year=?/month=?/{date}.parquet
-       a naváže hned po něm. Pokud žádné soubory nejsou, začne
+    1. Zjistí poslední stažené datum z měsíčních souborů
+       [root_folder]/market=?/timeframe=1D/year=?/month=??.parquet (maximum
+       window_start) a naváže hned po něm. Pokud žádné soubory nejsou, začne
        _REST_HISTORY_MONTHS měsíců zpět.
-    2. Pro každý den (u stocks/fx mimo víkendy) stáhne grouped daily aggs —
-       jeden dotaz za celý trh, cca 15 000 tickerů — a uloží je jako jeden
-       parquet soubor, jeden řádek na ticker.
-    3. Zápis: zstd komprese, řádky seřazené podle *ticker* a uvnitř podle
+    2. Postupně stáhne všechny chybějící dny (u stocks/fx mimo víkendy) —
+       jeden dotaz vrátí grouped daily aggs za celý trh, cca 15 000 tickerů.
+    3. Stažené dny se hromadí v bufferu a do souboru se zapíší najednou,
+       jakmile se přejde do dalšího měsíce: existující měsíční soubor se
+       načte, nové dny se k němu přidají a soubor se přepíše. V paměti je tak
+       nejvýš jeden měsíc dat. Duplicity nevznikají, protože se začíná až za
+       posledním uloženým dnem (viz bod 1).
+    4. Zápis: zstd komprese, řádky seřazené podle *ticker* a uvnitř podle
        *window_start*, row groups po menších blocích — soubor se tak dá
-       číst po tickerech.
+       číst po tickerech. Zápis jde přes dočasný soubor a Path.replace(),
+       aby pád uprostřed nenechal měsíc bez už uložených dnů.
 
     Sloupce odpovídají flat souborům (window_start, transactions), aby obě
     cesty stahování dávaly stejné schéma; navíc je vwap, který REST vrací.
     """
 
-    def _day_dir(market: str, day: date) -> Path:
-        """Cesta k parquet souboru dne v hive struktuře."""
+    def _month_path(market: str, day: date) -> Path:
+        """Cesta k měsíčnímu parquet souboru v hive struktuře."""
         return (
             cfg.root_folder / f"market={market}" / "timeframe=1D"
-            / f"year={day.year}" / f"month={day.month:02d}"
-            / f"{day.isoformat()}.parquet"
+            / f"year={day.year}" / f"month={day.month:02d}.parquet"
         )
+
+    def _last_downloaded_day(market: str) -> date | None:
+        """Nejnovější uložený den trhu = maximum window_start v posledním měsíci.
+
+        Čte se jen jeden sloupec nejnovějšího souboru; názvy souborů
+        (month=??.parquet) datum neobsahují, takže se musí podívat do dat.
+        """
+        market_dir = cfg.root_folder / f"market={market}" / "timeframe=1D"
+        if not market_dir.is_dir():
+            return None
+        files = sorted(market_dir.glob("year=*/month=*.parquet"))
+        if not files:
+            return None
+
+        import pyarrow.parquet as pq
+
+        column = pq.read_table(files[-1], columns=["window_start"]).column(
+            "window_start"
+        )
+        if len(column) == 0:
+            return None
+        newest_ns = max(column.to_pylist())
+        return datetime.fromtimestamp(
+            newest_ns / 1_000_000_000, tz=timezone.utc
+        ).date()
 
     def _rest_client():
         """Vytvoří Massive REST klienta (lazy import kvůli závislosti)."""
@@ -513,8 +542,13 @@ def update_daily(cfg: AppConfig) -> None:
             f"den {day} ({market}) se nepodařilo stáhnout: {last_exc}"
         )
 
-    def _save_day(rows: list[dict], dest: Path) -> None:
-        """Uloží den do parquet: zstd, řádky dle tickeru, row groups."""
+    def _save_month(market: str, day: date, by_day: dict[date, list[dict]]) -> Path:
+        """Přidá stažené dny do měsíčního parquet souboru.
+
+        Existující soubor se načte, nové dny se k němu přičtou a výsledek se
+        setřídí podle *ticker* a *window_start*. Zápis jde přes dočasný soubor
+        a Path.replace(), takže pád uprostřed nezničí už uložené dny měsíce.
+        """
         try:
             import pyarrow as pa
             import pyarrow.parquet as pq
@@ -522,15 +556,30 @@ def update_daily(cfg: AppConfig) -> None:
             log.error("Chybí pyarrow — nainstaluj: pip install pyarrow")
             sys.exit(1)
 
-        table = pa.Table.from_pylist(rows)
+        dest = _month_path(market, day)
+        rows = [row for day_rows in by_day.values() for row in day_rows]
+        tables = []
+        if dest.is_file():
+            tables.append(pq.read_table(dest))
+        tables.append(pa.Table.from_pylist(rows))
+        # promote_options: první zápis může mít sloupec celý NULL (typ null),
+        # při dalším běhu už int64 — bez povýšení by concat spadl.
+        table = (
+            pa.concat_tables(tables, promote_options="default")
+            if len(tables) > 1 else tables[0]
+        )
         table = table.sort_by(
             [("ticker", "ascending"), ("window_start", "ascending")]
         )
+
         dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + ".tmp")
         pq.write_table(
-            table, dest, compression="zstd",
+            table, tmp, compression="zstd",
             row_group_size=_DAY_ROW_GROUP_SIZE,
         )
+        tmp.replace(dest)
+        return dest
 
     if cfg.subscription:
         log.info(
@@ -544,8 +593,27 @@ def update_daily(cfg: AppConfig) -> None:
     # Dnešní agregace ještě nejsou uzavřené — končíme včerejškem.
     end = date.today() - timedelta(days=1)
 
+    # Buffer pro stažené dny právě zpracovávaného měsíce. Jakmile se přejde do
+    # dalšího měsíce, buffer se zapíše do měsíčního souboru a uvolní — v paměti
+    # tak zůstává nejvýš jeden měsíc dat, i když se doplňuje 23 měsíců historie.
+    buffer: dict[date, list[dict]] = {}
+    buffer_month: tuple[int, int] | None = None
+
+    def _flush(market: str) -> None:
+        """Zapíše nasbírané dny do měsíčního souboru (prázdný buffer nic nedělá)."""
+        nonlocal buffer, buffer_month
+        if not buffer:
+            return
+        dest = _save_month(market, min(buffer), buffer)
+        log.info(
+            "Uloženo %s (%d dní, %d řádků)",
+            dest, len(buffer), sum(len(rows) for rows in buffer.values()),
+        )
+        buffer = {}
+        buffer_month = None
+
     for market in cfg.markets:
-        last = last_downloaded_date(cfg, market, "1D")
+        last = _last_downloaded_day(market)
         start = last + timedelta(days=1) if last else default_start
         if start > end:
             log.info("Trh %s je aktuální — není co stahovat.", market)
@@ -558,6 +626,10 @@ def update_daily(cfg: AppConfig) -> None:
                 day += timedelta(days=1)  # zavřeno, dotaz by byl zbytečný
                 continue
 
+            # Přechod do dalšího měsíce — předchozí měsíc se uloží najednou.
+            if buffer_month is not None and (day.year, day.month) != buffer_month:
+                _flush(market)
+
             try:
                 rows = _fetch_with_retries(client, market, day)
             except _RestError as exc:
@@ -567,14 +639,17 @@ def update_daily(cfg: AppConfig) -> None:
                 break
 
             if rows:
-                dest = _day_dir(market, day)
-                _save_day(rows, dest)
-                log.info("Uloženo %s (%d tickerů)", dest, len(rows))
+                buffer[day] = rows
+                buffer_month = (day.year, day.month)
             else:
                 log.info("%s: žádná data (svátek nebo zavřený trh).", day)
 
             time.sleep(_REST_DELAY_SECONDS)
             day += timedelta(days=1)
+
+        # I po selhání se uloží, co se stihlo stáhnout — jinak by přišla
+        # o data a příští běh by je stahoval znovu (a zbytečně pálil kvótu).
+        _flush(market)
 
 
 # Maximální počet záznamů, který REST API vrátí v jednom dotazu.
