@@ -59,7 +59,7 @@ Nesjednocovat bez dotazu — jsou to vědomá rozhodnutí uživatele:
 
 ## Zrádná místa
 
-**Pomocné funkce patří do těla volající funkce**, ne na úroveň modulu — uživatel to tak chce a opakovaně to vynucoval (`update_flat_files`, `update_daily` i `update_minute` mají všechny helpery vnořené). Na úrovni modulu zůstávají jen konstanty a výjimkové třídy (`_NotOnS3`, `_RestError`). Důsledek: vnořené funkce **nelze monkeypatchovat z testů**, proto testy podstrkují fake moduly do `sys.modules` (`boto3`, `massive`) — lazy importy jsou také uvnitř funkcí.
+**Pomocné funkce patří do těla volající funkce**, ne na úroveň modulu — uživatel to tak chce a opakovaně to vynucoval (`update_flat_files`, `update_daily` i `update_minute` mají všechny helpery vnořené). Na úrovni modulu zůstávají jen konstanty, výjimkové třídy (`_NotOnS3`, `_RestError`) a `_bars_to_table()` — převod stažených barů na tabulku s pevným schématem, který potřebují obě REST cesty; duplikovaná definice schématu by se rozešla. Důsledek vnořených funkcí: **nelze je monkeypatchovat z testů**, proto testy podstrkují fake moduly do `sys.modules` (`boto3`, `massive`) — lazy importy jsou také uvnitř funkcí.
 
 **Testy nesmí sahat na síť.** `_test_*.py` podstrkují fake modul; `_test_real_client.py` používá pravou knihovnu, ale vyměňuje jen `RESTClient._get` a `_paginate` (jediná dvě místa, kudy teče síť) a uvnitř volá pravý deserializer. Když se helper přesune z těla funkce ven, tyhle záměny přestanou fungovat.
 
@@ -70,6 +70,8 @@ Nesjednocovat bez dotazu — jsou to vědomá rozhodnutí uživatele:
 **Logy jdou na stdout a do souboru.** `setup_logging()` na importu nastaví jen konzoli; `__main__` ho volá znovu s `cfg.root_folder / "logs"`, což přidá `FileHandler` do `[root_folder]/logs/massive_data.log` (UTF-8, bez rotace, opakované volání handler neduplikuje). Běží na Linuxu s UTF-8 — diakritika ani `—` v log zprávách nevadí, žádné ASCII omezení tu není.
 
 **Měsíční soubor se nikdy neappenduje.** `_save_month` načte existující parquet, přidá nové dny přes `concat_tables`, setřídí a zapíše přes `*.tmp` + `Path.replace()`. Deduplikace tam není — nepotřebná, protože se začíná až za `max(window_start)`; ruční zásah do souboru ji ale obejde. Buffer drží nejvýš jeden měsíc, takže ani 23měsíční naplnění nesežere paměť.
+
+**Bary z REST musí jít přes `_bars_to_table()`.** `pa.Table.from_pylist` si odvodí typy z hodnot a adjusted volume je jednou `int64`, jednou `double`; `concat_tables(promote)` int64 vs double nesjednotí, takže merge měsíce spadne na `Field volume has incompatible types`. Funkce proto volume i transactions zaokrouhluje na int64 — stejné schéma mají flat files i data z `convert_ohlc_daily.py`.
 
 **`update_minute` není v `__main__`** — je pomalá (12,5 s na ticker) a běží se ručně. `_REST_DELAY_SECONDS = 12.5` je napevno v kódu, v `config.yaml` klíč pro prodlevu není.
 

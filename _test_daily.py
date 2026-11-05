@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 import massive_data as md
@@ -32,11 +33,17 @@ time.sleep = lambda s: sleeps.append(s)       # test nesmí reálně čekat
 
 
 def fake_bars(day):
-    """Dva tickery, záměrně v opačném pořadí než abecedně."""
+    """Dva tickery, záměrně v opačném pořadí než abecedně.
+
+    Volume střídavě int a double: tak vypadají reálná adjusted data a dřív to
+    shodilo merge měsíce ("Field volume has incompatible types: int64 vs
+    double"), protože si pyarrow odvodil typ z hodnot.
+    """
     base = (day - date(1970, 1, 1)).days * 86_400_000
+    volume = 200 if day.toordinal() % 2 == 0 else 200.6
     return [
         SimpleNamespace(ticker="MSFT", timestamp=base, open=2.0, high=2.1,
-                        low=1.9, close=2.05, volume=200, transactions=20, vwap=2.0),
+                        low=1.9, close=2.05, volume=volume, transactions=20, vwap=2.0),
         SimpleNamespace(ticker="AAPL", timestamp=base, open=1.0, high=1.1,
                         low=0.9, close=1.05, volume=100, transactions=10, vwap=1.0),
     ]
@@ -149,6 +156,18 @@ assert ws[0] // 1_000_000_000 == (
 ), "window_start neodpovídá půlnoci UTC daného dne"
 assert set(t.column_names) == {"ticker", "window_start", "open", "high", "low",
                                "close", "volume", "transactions", "vwap"}
+# pevné schéma: bez něj si pyarrow odvodí volume jednou int64, jednou double
+assert t.schema.field("window_start").type == pa.int64()
+assert t.schema.field("volume").type == pa.int64()
+assert t.schema.field("transactions").type == pa.int64()
+assert t.schema.field("close").type == pa.float64()
+assert t.schema.field("ticker").type == pa.string()
+volumes = {tk: set() for tk in ("AAPL", "MSFT")}
+for tk, vol in zip(tickers, t.column("volume").to_pylist()):
+    assert isinstance(vol, int), (tk, vol)
+    volumes[tk].add(vol)
+assert volumes["AAPL"] == {100}, volumes
+assert volumes["MSFT"] <= {200, 201} and volumes["MSFT"], volumes
 assert not list(ROOT.rglob("*.tmp")), "zůstal dočasný soubor po zápisu"
 print(f"řazení ticker/window_start + ns + schéma: OK ({dest.name})")
 

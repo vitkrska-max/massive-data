@@ -408,6 +408,38 @@ class _RestError(Exception):
     """Den se nepodařilo stáhnout ani po cfg.retries pokusech."""
 
 
+def _bars_to_table(rows: list[dict]):
+    """Převede stažené bary na tabulku s pevným schématem.
+
+    Bez explicitního schématu si pyarrow odvodí typy z hodnot: adjusted volume
+    bývá jednou int64, jednou double — a `concat_tables(promote)` int64 vs
+    double nesjednotí, takže merge měsíce spadne na
+    "Field volume has incompatible types". Volume a transactions proto
+    zaokrouhlujeme na int64; tím je schéma stejné jako u flat files i u
+    konvertovaných dat (convert_ohlc_daily.py).
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    def _floats(name: str):
+        return pa.array([row.get(name) for row in rows], pa.float64())
+
+    def _ints(name: str):
+        return pc.cast(pc.round(_floats(name)), pa.int64())
+
+    return pa.table({
+        "ticker": pa.array([row.get("ticker") for row in rows], pa.string()),
+        "window_start": pa.array([row.get("window_start") for row in rows], pa.int64()),
+        "open": _floats("open"),
+        "high": _floats("high"),
+        "low": _floats("low"),
+        "close": _floats("close"),
+        "volume": _ints("volume"),
+        "transactions": _ints("transactions"),
+        "vwap": _floats("vwap"),
+    })
+
+
 def last_downloaded_date(cfg: AppConfig, market: str, timeframe: str) -> date | None:
     """Nejnovější datum z lokálních parquet souborů daného trhu."""
     market_dir = cfg.root_folder / f"market={market}" / f"timeframe={timeframe}"
@@ -557,11 +589,14 @@ def update_daily(cfg: AppConfig) -> None:
             sys.exit(1)
 
         dest = _month_path(market, day)
-        rows = [row for day_rows in by_day.values() for row in day_rows]
         tables = []
         if dest.is_file():
             tables.append(pq.read_table(dest))
-        tables.append(pa.Table.from_pylist(rows))
+        # Pevné schéma (viz _bars_to_table) — jinak concat měsíce spadne na
+        # int64 vs double u adjusted volume.
+        tables.append(_bars_to_table(
+            [row for day_rows in by_day.values() for row in day_rows]
+        ))
         # promote_options: první zápis může mít sloupec celý NULL (typ null),
         # při dalším běhu už int64 — bez povýšení by concat spadl.
         table = (
@@ -809,13 +844,12 @@ def update_minute(cfg: AppConfig) -> None:
     def _write_day(market: str, day: date, rows: list[dict]) -> Path:
         """Uloží jeden den do parquet: zstd, řazení dle tickeru, row groups."""
         try:
-            import pyarrow as pa
             import pyarrow.parquet as pq
         except ImportError:
             log.error("Chybí pyarrow — nainstaluj: pip install pyarrow")
             sys.exit(1)
 
-        table = pa.Table.from_pylist(rows)
+        table = _bars_to_table(rows)
         table = table.sort_by(
             [("ticker", "ascending"), ("window_start", "ascending")]
         )
@@ -909,8 +943,8 @@ if __name__ == "__main__":
     cfg = load_config()
     # Teprve teď je známý root_folder — odsud se loguje i do [root_folder]/logs.
     setup_logging(cfg.root_folder / "logs")
-    update_flat_files(cfg, timeframe="1D")
-    update_flat_files(cfg, timeframe="1m")
+    # update_flat_files(cfg, timeframe="1D")
+    # update_flat_files(cfg, timeframe="1m")
     # Při subscription=False výše uvedené funkce nic nestahují a denní data
     # dotáhne REST; při subscription=True update_daily rovnou skončí.
     update_daily(cfg)
