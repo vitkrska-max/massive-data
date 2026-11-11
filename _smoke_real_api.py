@@ -39,8 +39,8 @@ print(f"API klíč: {cfg.require_secret('api_key')[:6]}...{cfg.require_secret('a
       f" | markets={cfg.markets} | subscription={cfg.subscription}")
 cfg.root_folder = ROOT          # nikdy nepíšeme do skutečného root_folder
 md.REPO_ROOT = TICKER_DIR
-md._REST_DELAY_SECONDS = 0
-time.sleep = lambda s: None     # ať test nečeká 12,5 s mezi dotazy
+md._reset_rate_limit()
+time.sleep = lambda s: None     # ať smoke test nečeká na rate limit
 
 # Poslední uzavřený obchodní den (o víkendu se neobchoduje).
 day = date.today() - timedelta(days=1)

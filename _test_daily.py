@@ -27,7 +27,7 @@ START = TODAY - md.relativedelta(months=23)   # _REST_HISTORY_MONTHS
 ROOTS = [Path("_test_daily_root_a"), Path("_test_daily_root_b")]
 ROOT = ROOTS[0]
 
-md._REST_DELAY_SECONDS = 0
+md._reset_rate_limit()
 sleeps = []
 time.sleep = lambda s: sleeps.append(s)       # test nesmí reálně čekat
 

@@ -23,7 +23,7 @@ TICKER_DIR = Path("_test_minute_dir")
 ROOTS = [Path("_test_minute_root_a"), Path("_test_minute_root_b")]
 
 md.REPO_ROOT = TICKER_DIR
-md._REST_DELAY_SECONDS = 0
+md._reset_rate_limit()
 time.sleep = lambda s: None                      # test nesmí reálně čekat
 
 for r in [TICKER_DIR] + ROOTS:

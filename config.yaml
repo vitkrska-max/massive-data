@@ -8,9 +8,8 @@
 # --- Předplatné ---
 # Jestliže je zaplaceno předplatné, tak pro stahování využít Flat soubory.
 # Jestliže není zaplaceno, tak REST Api mají omezení na 5 dotazů za minutu.
-# To je teoreticky prodleva 12.0s mezi dotazy.
-# Reálně je potřeba dát prodlevu delší (12.5s) aby nedocházelo k chybám
-# 429 Too Many Requests.
+# Tempo dotazů hlídá _throttle() v massive_data.py: klouzavé okno 5 dotazů
+# za 60 s (s rezervou 0.5 s), s předplatným se nečeká.
 subscription: False
 
 # --- Hloubka historie ---
@@ -26,10 +25,13 @@ markets:
   - "fx"
 
 # --- Adresář lokálního úložiště ---
-# Adresář pro logy[root_folder]/logs
-# FlatFiles: [root_folder]/flat_files/{market}/{timeframe}/{year}/{month}/{date}.csv.gz
-# Parquet[root_folder]/{market}/{timeframe}/{year}/{month}/{date}.parquet
-# Ostatní data: [root_folder]/{market}/reference.db
+# Logy:      [root_folder]/logs            (massive_data.log, UTF-8, bez rotace)
+# FlatFiles: [root_folder]/{market}/flat_files/{timeframe}/{year}/{month}/{date}.csv.gz
+# Parquet 1D (REST, update_daily):  [root_folder]/market={market}/timeframe=1D/year={YYYY}/month={MM}.parquet
+# Parquet 1m (REST, update_minute): [root_folder]/market={market}/timeframe=1m/year={YYYY}/month={MM}/{date}.parquet
+# Parquet flat files:               [root_folder]/{market}/timeframe={timeframe}/year={YYYY}/month={MM}/{date}.parquet
+# Tickers:   [root_folder]/{market}/tickers/{year}/{month}/{date}.parquet  (historické snapshoty)
+#            [root_folder]/{market}/tickers/reference.sqlite              (aktuální data)
 root_folder: "/home/vitek/trading/data"
 
 # --- Opakování dotazů v případě chyb ---
@@ -40,3 +42,9 @@ retries: 3
 # --- SEC kontaktní email (me_ticker_info.py) ---
 # SEC vyžaduje identifikaci při stahování dat (https://www.sec.gov/developer)
 sec_contact_email: "vit.krska@gmail.com"
+
+# --- Seznam tickerů pro update_tickers ---
+# Šablona názvu souboru, {market} se nahradí názvem trhu. Jeden ticker na
+# řádek, '#' = komentář. Když soubor neexistuje, bere se tabulka tickers
+# z [root_folder]/{market}/tickers/reference.sqlite, jinak all-tickers z REST.
+tickers_info: "tickers_{market}.txt"

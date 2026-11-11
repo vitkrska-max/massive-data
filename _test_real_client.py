@@ -32,7 +32,7 @@ for r in (ROOT, TICKER_DIR):
 TICKER_DIR.mkdir()
 
 md.REPO_ROOT = TICKER_DIR
-md._REST_DELAY_SECONDS = 0
+md._reset_rate_limit()
 time.sleep = lambda s: None
 
 CALLS = []

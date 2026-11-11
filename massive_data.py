@@ -12,6 +12,8 @@ Rozdělení konfigurace:
 """
 
 import logging
+import shutil
+import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field, fields
@@ -105,6 +107,10 @@ class AppConfig:
     retries: int = 3
     root_folder: Path = Path("~/trading_data/massive/").expanduser()
     sec_contact_email: str = "your@email.com"
+    # Šablona souboru se seznamem tickerů pro update_tickers ({market} se
+    # nahradí názvem trhu). Když soubor neexistuje, bere se tabulka tickers
+    # z reference.sqlite, jinak all-tickers z REST.
+    tickers_info: str = "tickers_{market}.txt"
 
     # --- secrets.yaml ---
     # Optional, protože ne každý skript všechny potřebuje — konkrétní klíč
@@ -131,12 +137,12 @@ class AppConfig:
         return value
 
     def flatfiles_dest(self, market: str, timeframe: str) -> Path:
-        """Kořen cesty pro flat soubory: root_folder/flat_files/{market}/{timeframe}/.
+        """Kořen cesty pro flat soubory: root_folder/{market}/flat_files/{timeframe}/.
 
-        Struktura podle config.yaml:
-        [root_folder]/flat_files/{market}/{timeframe}/{year}/{month}/{date}.csv.gz
+        Struktura podle zadání:
+        [root_folder]/{market}/flat_files/{timeframe}/{year}/{month}/{date}.csv.gz
         """
-        return self.root_folder / "flat_files" / market / timeframe
+        return self.root_folder / market / "flat_files" / timeframe
 
 
 # ---------------------------------------------------------------------------
@@ -237,9 +243,9 @@ def update_flat_files(cfg: AppConfig, timeframe: str = "1D") -> None:
        poslední stažené datum + 1 den.
     2. Stáhne chybějící soubory z Massive (viz
        https://massive.com/docs/flat-files/quickstart) a uloží je do
-       [root_folder]/flat_files/{market}/{timeframe}/{year}/{month}/{date}.csv.gz
+       [root_folder]/{market}/flat_files/{timeframe}/{year}/{month}/{date}.csv.gz
     3. Každý stažený soubor převede do parquet a uloží do HIVE struktury:
-       [root_folder]/{market}/timefram=?/year=?/month=?/{date}.parquet
+       [root_folder]/{market}/timeframe=?/year=?/month=?/{date}.parquet
        Zápis: zstd komprese, row groups, řádky seřazené podle *ticker*
        a uvnitř podle *timestamp* — row groups se tak shlukují po tickerech.
     """
@@ -313,7 +319,7 @@ def update_flat_files(cfg: AppConfig, timeframe: str = "1D") -> None:
     def _csv_gz_to_parquet(src: Path, dest: Path) -> None:
         """Převede csv.gz na parquet: zstd, row groups, řádky dle tickeru a timestamp.
 
-        Seřazení zajistí, že se row groups shlukují po tickerech (viz MASSIVE.md).
+        Seřazení zajistí, že se row groups shlukují po tickerech (viz zadání v AGENT.md).
         """
         try:
             import pyarrow.csv as pv
@@ -389,9 +395,51 @@ def update_flat_files(cfg: AppConfig, timeframe: str = "1D") -> None:
 # REST API (subscription=False)
 # ---------------------------------------------------------------------------
 
-# Prodleva mezi dotazy: bez předplatného je limit 5 dotazů za minutu,
-# 12.5s je bezpečná hodnota proti chybě 429 (viz config.yaml).
-_REST_DELAY_SECONDS = 12.5
+# Bez předplatného Massive dovolí 5 dotazů za minutu — limit platí pro celý
+# proces (jeden API klíč), ne pro jednu funkci. Místo pevných prodlev se hlídá
+# klouzavé okno: prvních pět dotazů jde hned po sobě a pak se čeká jen do
+# konce okna, takže se neplytvá časem ani se nelítá na hranici 429.
+_REST_RATE_LIMIT = 5
+_REST_RATE_WINDOW = 60.0
+# Malá rezerva, aby dotaz nespadl přesně na hranici okna.
+_REST_RATE_MARGIN = 0.5
+
+# Časy odeslaných dotazů (time.monotonic) v klouzavém okně — modulová, protože
+# se o limit dělí update_tickers, update_daily i update_minute v jednom běhu.
+_request_times: list[float] = []
+
+
+def _reset_rate_limit() -> None:
+    """Zapomene historii dotazů (mezi testy; po 429, kdy nás API už zpomalilo)."""
+    _request_times.clear()
+
+
+def _throttle(cfg: AppConfig) -> None:
+    """Počká, aby v okně 60 s nebylo víc než 5 REST dotazů (bez předplatného).
+
+    Volá se před každým HTTP dotazem včetně retry — i neúspěšný pokus spotřebuje
+    kvótu. S předplatným se nečeká. Omezuje jen volání viditelná v našem kódu;
+    stránkování uvnitř knihovny `massive` (pagination=True) o limitu neví.
+    """
+    if cfg.subscription:
+        return
+
+    now = time.monotonic()
+    while _request_times and now - _request_times[0] > _REST_RATE_WINDOW:
+        _request_times.pop(0)
+
+    if len(_request_times) >= _REST_RATE_LIMIT:
+        wait = _REST_RATE_WINDOW - (now - _request_times[0]) + _REST_RATE_MARGIN
+        if wait > 0:
+            log.debug("Rate limit: čekám %.1fs na uvolnění okna.", wait)
+            time.sleep(wait)
+        now = time.monotonic()
+        while _request_times and now - _request_times[0] > _REST_RATE_WINDOW:
+            _request_times.pop(0)
+
+    _request_times.append(now)
+
+
 # Hloubka historie při prvním naplnění přes REST (v měsících).
 _REST_HISTORY_MONTHS = 23
 # Trh → locale pro grouped daily endpoint.
@@ -558,6 +606,7 @@ def update_daily(cfg: AppConfig) -> None:
         """
         last_exc = None
         for attempt in range(1, cfg.retries + 1):
+            _throttle(cfg)
             try:
                 return _fetch_day(client, market, day)
             except Exception as exc:
@@ -570,6 +619,8 @@ def update_daily(cfg: AppConfig) -> None:
                     attempt, cfg.retries, day, market, exc, wait,
                 )
                 time.sleep(wait)
+                if "429" in str(exc):
+                    _reset_rate_limit()   # API už nás zpomalilo, okno je vyčerpané
         raise _RestError(
             f"den {day} ({market}) se nepodařilo stáhnout: {last_exc}"
         )
@@ -679,12 +730,523 @@ def update_daily(cfg: AppConfig) -> None:
             else:
                 log.info("%s: žádná data (svátek nebo zavřený trh).", day)
 
-            time.sleep(_REST_DELAY_SECONDS)
             day += timedelta(days=1)
 
         # I po selhání se uloží, co se stihlo stáhnout — jinak by přišla
         # o data a příští běh by je stahoval znovu (a zbytečně pálil kvótu).
         _flush(market)
+
+
+
+
+# ---------------------------------------------------------------------------
+# Tickers — metadata o tickerech (reference.sqlite) + denní snapshoty (REST)
+# ---------------------------------------------------------------------------
+
+# Sloupce tabulky tickers = všechna pole ticker-overview
+# (massive.rest.models.tickers.TickerDetails) + naše last_updated. Vnořené
+# address/branding se rozbalují do plochých sloupců, aby snapshot parquet měl
+# stejné schéma jako tabulka a šel číst i bez SQLite.
+_TICKERS_COLUMNS = (
+    "ticker", "name", "active", "market", "locale", "primary_exchange", "type",
+    "currency_name", "currency_symbol", "base_currency_name",
+    "base_currency_symbol", "cik", "composite_figi", "share_class_figi",
+    "sic_code", "sic_description", "market_cap",
+    "share_class_shares_outstanding", "weighted_shares_outstanding",
+    "total_employees", "list_date", "delisted_utc", "description",
+    "homepage_url", "phone_number", "ticker_root", "ticker_suffix",
+    "address_line1", "address_line2", "address_city", "address_state",
+    "address_country", "address_postal_code", "logo_url", "icon_url",
+    "accent_color", "light_color", "dark_color", "last_updated",
+)
+# Položky overview, které se kopírují 1:1 (zbytek jsou vnořené address/branding
+# a naše last_updated).
+_TICKERS_PLAIN_FIELDS = (
+    "name", "active", "market", "locale", "primary_exchange", "type",
+    "currency_name", "currency_symbol", "base_currency_name",
+    "base_currency_symbol", "cik", "composite_figi", "share_class_figi",
+    "sic_code", "sic_description", "market_cap",
+    "share_class_shares_outstanding", "weighted_shares_outstanding",
+    "total_employees", "list_date", "delisted_utc", "description",
+    "homepage_url", "phone_number", "ticker_root", "ticker_suffix",
+)
+
+_DDL_SIC_SEGMENTS = """
+CREATE TABLE IF NOT EXISTS sic_segments (
+    sic_code    TEXT PRIMARY KEY,
+    sec_office  TEXT,
+    industry    TEXT,
+    segment     TEXT NOT NULL
+);
+"""
+
+_DDL_TICKERS = """
+CREATE TABLE IF NOT EXISTS tickers (
+    ticker                          TEXT PRIMARY KEY,
+    name                            TEXT,
+    active                          BOOLEAN,
+    market                          TEXT,
+    locale                          TEXT,
+    primary_exchange                TEXT,
+    type                            TEXT,
+    currency_name                   TEXT,
+    currency_symbol                 TEXT,
+    base_currency_name              TEXT,
+    base_currency_symbol            TEXT,
+    cik                             TEXT,
+    composite_figi                  TEXT,
+    share_class_figi                TEXT,
+    sic_code                        TEXT REFERENCES sic_segments(sic_code),
+    sic_description                 TEXT,
+    market_cap                      REAL,
+    share_class_shares_outstanding  INTEGER,
+    weighted_shares_outstanding     INTEGER,
+    total_employees                 INTEGER,
+    list_date                       TEXT,
+    delisted_utc                    TEXT,
+    description                     TEXT,
+    homepage_url                    TEXT,
+    phone_number                    TEXT,
+    ticker_root                     TEXT,
+    ticker_suffix                   TEXT,
+    address_line1                   TEXT,
+    address_line2                   TEXT,
+    address_city                    TEXT,
+    address_state                   TEXT,
+    address_country                 TEXT,
+    address_postal_code             TEXT,
+    logo_url                        TEXT,
+    icon_url                        TEXT,
+    accent_color                    TEXT,
+    light_color                     TEXT,
+    dark_color                      TEXT,
+    last_updated                    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tickers_sic ON tickers(sic_code);
+CREATE INDEX IF NOT EXISTS idx_tickers_active ON tickers(active);
+"""
+
+# Velikost dávky = kolik tickerů jde do jednoho partu a jednoho commitu.
+# Tempo REST dotazů hlídá _throttle() (klouzavé okno 5 dotazů za minutu).
+_TICKERS_BATCH = 5
+# Row group u snapshotu tickerů.
+_TICKERS_ROW_GROUP_SIZE = 5_000
+# Dočasné dílčí soubory rozpracovaného snapshotu — díky nim běh po pádu naváže
+# a nestahuje hotové tickery znovu.
+_TICKERS_TMP_DIR = "_tmp"
+# Zdroj SIC kódů; SEC vyžaduje identifikaci v User-Agent (cfg.sec_contact_email).
+_SIC_URL = "https://www.sec.gov/info/edgar/siccodes.htm"
+# Mapování SEC office -> segment (převzato z legacy me_ticker_info.py).
+_SIC_OFFICE_SEGMENT = {
+    "Office of Technology":              "Technology",
+    "Office of Finance":                 "Finance",
+    "Office of Crypto Assets":           "Finance",
+    "Office of Finance or Office of Crypto Assets": "Finance",
+    "Office of Life Sciences":           "Healthcare",
+    "Office of Energy & Transportation": "Energy & Transportation",
+    "Office of Manufacturing":           "Industrials",
+    "Office of Real Estate & Construction": "Real Estate",
+    "Office of Trade & Services":        "Consumer & Services",
+    "Office of Trade & Services or Office of Energy & Transportation": "Consumer & Services",
+    "Office of International Corp Fin":  "International",
+    "Office of Structured Finance":      "Finance",
+    "Industrial Applications and Services": "Industrials",
+}
+
+
+def _parse_sic_html(html: str) -> list[tuple[str, str, str, str]]:
+    """Rozparsuje tabulku SIC kódů ze SEC na (sic_code, sec_office, industry, segment).
+
+    Parsuje se stdlibem, aby projekt nemusel tahat pandas/html5lib jako legacy
+    me_ticker_info.py. Řádky s nečíselným prvním sloupcem (hlavička) se přeskakují.
+    """
+    from html.parser import HTMLParser
+
+    class _Parser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.rows: list[list[str]] = []
+            self._cells: list[str] | None = None
+            self._text: list[str] = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "tr":
+                self._cells = []
+            elif tag in ("td", "th") and self._cells is not None:
+                self._text = []
+
+        def handle_data(self, data):
+            if self._cells is not None:
+                self._text.append(data)
+
+        def handle_endtag(self, tag):
+            if tag in ("td", "th") and self._cells is not None:
+                self._cells.append(" ".join("".join(self._text).split()))
+            elif tag == "tr" and self._cells is not None:
+                self.rows.append(self._cells)
+                self._cells = None
+
+    parser = _Parser()
+    parser.feed(html)
+
+    parsed = []
+    for cells in parser.rows:
+        if len(cells) < 3:
+            continue
+        code = cells[0].strip()
+        if not code.isdigit():
+            continue
+        office = cells[1].strip()
+        parsed.append((
+            code.zfill(4),
+            office,
+            cells[2].strip(),
+            _SIC_OFFICE_SEGMENT.get(office, "Other"),
+        ))
+    return parsed
+
+
+def update_sic_segments(cfg: AppConfig) -> None:
+    """Naplní tabulku sic_segments v každé [root]/market/tickers/reference.sqlite.
+
+    Zdroj je tabulka SIC kódů na SEC; kódy, jejichž úřad není v mapě, dostanou
+    segment "Other". Volá se z update_tickers, když je tabulka prázdná.
+    """
+
+    def _fetch(url: str, email: str) -> str:
+        """Stáhne HTML stránky SEC (identifikace v User-Agent je povinná)."""
+        import urllib.request
+
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": f"massive-data/1.0 (personal research; {email})"},
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.read().decode("utf-8", errors="replace")
+
+    rows = _parse_sic_html(_fetch(_SIC_URL, cfg.sec_contact_email))
+    if not rows:
+        log.error("Na %s se nepodařilo najít tabulku SIC kódů.", _SIC_URL)
+        return
+
+    for market in cfg.markets:
+        path = cfg.root_folder / market / "tickers" / "reference.sqlite"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(path)
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+            con.executescript(_DDL_SIC_SEGMENTS)
+            con.executemany(
+                """INSERT INTO sic_segments (sic_code, sec_office, industry, segment)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(sic_code) DO UPDATE SET
+                       sec_office = excluded.sec_office,
+                       industry   = excluded.industry,
+                       segment    = excluded.segment""",
+                rows,
+            )
+            con.commit()
+            log.info("sic_segments: %s (%d kódů)", path, len(rows))
+        finally:
+            con.close()
+
+
+def update_tickers(cfg: AppConfig, day: date | None = None,
+                   tickers: list[str] | None = None) -> None:
+    """Aktualizuje metadata o tickerech — snapshot parquet + reference.sqlite.
+
+    day: datum, pro které snapshot vzniká (default dnešní). Ukládá se i jako
+         tickers.last_updated, proto jen yyyy-mm-dd — TEXT se pak porovnává
+         lexikograficky správně a stejný tvar bere i REST `?date=`.
+    tickers: seznam tickerů. Když není zadán, zdroje se berou v pořadí:
+         1. soubor z cfg.tickers_info (šablona s {market}),
+         2. tabulka tickers v [root]/market=?/tickers/reference.sqlite,
+         3. REST all-tickers (jen aktivní).
+
+    Pro každý trh z cfg.markets:
+    1. Připraví reference.sqlite (WAL, FK) a doplní sic_segments, když je
+       prázdná (viz update_sic_segments).
+    2. Zjistí hotové tickery — ty ve snapshotu
+       [root]/market=?/tickers/{year}/{month}/{date}.parquet a v dočasných
+       částech [root]/market=?/tickers/_tmp/{date}/part-*.parquet. Hotové se
+       nestahují znovu, takže běh po pádu naváže.
+    3. Stahuje ticker-overview; tempo hlídá _throttle() (klouzavé okno
+       5 dotazů za minutu, bez předplatného). Dávku upsertne do tabulky tickers
+       (jen když tickers.last_updated < day) a zapíše jako part.
+    4. Na konci sloučí snapshot + party do jednoho parquet (zstd, row groups
+       5 000, řazeno podle tickeru, zápis přes *.tmp) a dočasný adresář smaže.
+    """
+
+    day = day or date.today()
+    day_iso = day.isoformat()
+
+    def _db_path(market: str) -> Path:
+        return cfg.root_folder / market / "tickers" / "reference.sqlite"
+
+    def _snapshot_path(market: str) -> Path:
+        return (
+            cfg.root_folder / market / "tickers"
+            / f"{day.year}" / f"{day.month:02d}" / f"{day_iso}.parquet"
+        )
+
+    def _tmp_dir(market: str) -> Path:
+        return cfg.root_folder / market / "tickers" / _TICKERS_TMP_DIR / day_iso
+
+    def _connect(market: str) -> sqlite3.Connection:
+        """Otevře (a případně vytvoří) reference.sqlite se schématem."""
+        path = _db_path(market)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(path)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA foreign_keys=ON")
+        con.executescript(_DDL_SIC_SEGMENTS + _DDL_TICKERS)
+        con.commit()
+        return con
+
+    def _rest_client():
+        """Vytvoří Massive REST klienta (lazy import kvůli závislosti)."""
+        try:
+            from massive import RESTClient
+        except ImportError:
+            log.error("Chybí massive — nainstaluj: pip install massive")
+            sys.exit(1)
+        return RESTClient(cfg.require_secret("api_key"))
+
+    def _ensure_sic(con: sqlite3.Connection) -> None:
+        """Doplní sic_segments; když se to nepovede, vypne na běh FK."""
+        if con.execute("SELECT 1 FROM sic_segments LIMIT 1").fetchone():
+            return
+        try:
+            update_sic_segments(cfg)
+        except Exception as exc:
+            log.warning("sic_segments se nepodařilo naplnit (%s).", exc)
+        if not con.execute("SELECT 1 FROM sic_segments LIMIT 1").fetchone():
+            log.warning(
+                "sic_segments je prázdná — na tento běh PRAGMA foreign_keys=OFF."
+            )
+            con.execute("PRAGMA foreign_keys=OFF")
+
+    def _wanted_tickers(con: sqlite3.Connection, client, market: str) -> list[str]:
+        """Seznam tickerů podle priority: parametr -> soubor -> DB -> all-tickers."""
+        if tickers:
+            return list(tickers)
+        path = REPO_ROOT / cfg.tickers_info.format(market=market)
+        if path.is_file():
+            loaded = [
+                line.strip()
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
+            if loaded:
+                log.info(
+                    "Trh %s: seznam tickerů ze souboru %s (%d).",
+                    market, path, len(loaded),
+                )
+                return loaded
+        rows = con.execute("SELECT ticker FROM tickers ORDER BY ticker").fetchall()
+        if rows:
+            log.info(
+                "Trh %s: seznam tickerů z tabulky tickers (%d).", market, len(rows)
+            )
+            return [row["ticker"] for row in rows]
+        log.info("Trh %s: seznam z REST all-tickers (active=true).", market)
+        return [bar.ticker for bar in client.list_tickers(market=market, active=True)]
+
+    def _done_tickers(market: str) -> set[str]:
+        """Ticere, které už jsou ve snapshotu nebo v dočasných částech."""
+        import pyarrow.parquet as pq
+
+        done: set[str] = set()
+        paths = [_snapshot_path(market), *sorted(_tmp_dir(market).glob("part-*.parquet"))]
+        for path in paths:
+            if path.is_file():
+                column = pq.read_table(path, columns=["ticker"]).column("ticker")
+                done |= set(column.to_pylist())
+        return done
+
+    def _row(obj) -> dict:
+        """Převede TickerDetails na plochý řádek tabulky tickers."""
+        address = getattr(obj, "address", None)
+        branding = getattr(obj, "branding", None)
+        row = {name: getattr(obj, name, None) for name in _TICKERS_PLAIN_FIELDS}
+        row["ticker"] = getattr(obj, "ticker", None)
+        row.update({
+            "address_line1": getattr(address, "address1", None),
+            "address_line2": getattr(address, "address2", None),
+            "address_city": getattr(address, "city", None),
+            "address_state": getattr(address, "state", None),
+            "address_country": getattr(address, "country", None),
+            "address_postal_code": getattr(address, "postal_code", None),
+            "logo_url": getattr(branding, "logo_url", None),
+            "icon_url": getattr(branding, "icon_url", None),
+            "accent_color": getattr(branding, "accent_color", None),
+            "light_color": getattr(branding, "light_color", None),
+            "dark_color": getattr(branding, "dark_color", None),
+            "last_updated": day_iso,
+        })
+        return row
+
+    def _schema():
+        """Pevné schéma snapshotu — bez něj si pyarrow odvodí typy z hodnot."""
+        import pyarrow as pa
+
+        ints = {
+            "share_class_shares_outstanding", "weighted_shares_outstanding",
+            "total_employees",
+        }
+        floats = {"market_cap"}
+        bools = {"active"}
+        return pa.schema([
+            (
+                name,
+                pa.bool_() if name in bools
+                else pa.int64() if name in ints
+                else pa.float64() if name in floats
+                else pa.string(),
+            )
+            for name in _TICKERS_COLUMNS
+        ])
+
+    def _table(rows: list[dict]):
+        import pyarrow as pa
+
+        return pa.Table.from_pylist(rows, schema=_schema())
+
+    def _safe_name(name: str) -> str:
+        """Název souboru bez znaků, které nechce Windows (ticker C:AEDEUR)."""
+        return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in name)
+
+    def _write_part(market: str, first_ticker: str, rows: list[dict]) -> Path:
+        """Zapíše dávku jako dočasný part (název podle prvního tickeru)."""
+        import pyarrow.parquet as pq
+
+        path = _tmp_dir(market) / f"part-{_safe_name(first_ticker)}.parquet"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(
+            _table(rows), path, compression="zstd",
+            row_group_size=_TICKERS_ROW_GROUP_SIZE,
+        )
+        return path
+
+    def _upsert(con: sqlite3.Connection, rows: list[dict]) -> None:
+        """Upsert do tickers; řádek se nepřepíše, když last_updated >= day."""
+        columns = ", ".join(_TICKERS_COLUMNS)
+        placeholders = ", ".join("?" * len(_TICKERS_COLUMNS))
+        updates = ", ".join(
+            f"{name} = excluded.{name}" for name in _TICKERS_COLUMNS if name != "ticker"
+        )
+        sql = (
+            f"INSERT INTO tickers ({columns}) VALUES ({placeholders}) "
+            f"ON CONFLICT(ticker) DO UPDATE SET {updates} "
+            f"WHERE tickers.last_updated < excluded.last_updated"
+        )
+        con.executemany(
+            sql, [tuple(row[name] for name in _TICKERS_COLUMNS) for row in rows]
+        )
+        con.commit()
+
+    def _fetch(client, ticker_name: str):
+        """Stáhne ticker-overview s opakováním (u 429 delší čekání)."""
+        last_exc = None
+        for attempt in range(1, cfg.retries + 1):
+            _throttle(cfg)
+            try:
+                return client.get_ticker_details(ticker_name)
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= cfg.retries:
+                    break
+                wait = 60.0 if "429" in str(exc) else 2.0 ** attempt
+                log.warning(
+                    "Pokus %d/%d selhal pro %s: %s — čekám %.0fs.",
+                    attempt, cfg.retries, ticker_name, exc, wait,
+                )
+                time.sleep(wait)
+                if "429" in str(exc):
+                    _reset_rate_limit()   # API už nás zpomalilo, okno je vyčerpané
+        raise _RestError(
+            f"ticker {ticker_name} se nepodařilo stáhnout: {last_exc}"
+        )
+
+    def _merge(market: str) -> tuple[Path, int] | None:
+        """Sloučí snapshot + party, zapíše snapshot atomicky, smaže tmp."""
+        import pyarrow.parquet as pq
+
+        sources = [
+            path
+            for path in [_snapshot_path(market), *sorted(_tmp_dir(market).glob("part-*.parquet"))]
+            if path.is_file()
+        ]
+        if not sources:
+            return None
+
+        by_ticker: dict[str, dict] = {}
+        for path in sources:
+            for row in pq.read_table(path).to_pylist():
+                previous = by_ticker.get(row["ticker"])
+                if previous is None or (row["last_updated"] or "") >= (previous["last_updated"] or ""):
+                    by_ticker[row["ticker"]] = row
+
+        table = _table([by_ticker[name] for name in sorted(by_ticker)])
+        dest = _snapshot_path(market)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + ".tmp")
+        pq.write_table(
+            table, tmp, compression="zstd",
+            row_group_size=_TICKERS_ROW_GROUP_SIZE,
+        )
+        tmp.replace(dest)
+        shutil.rmtree(_tmp_dir(market), ignore_errors=True)
+        return dest, table.num_rows
+
+    client = _rest_client()
+    for market in cfg.markets:
+        con = _connect(market)
+        try:
+            _ensure_sic(con)
+            wanted = _wanted_tickers(con, client, market)
+            if not wanted:
+                log.warning("Trh %s: seznam tickerů je prázdný — přeskakuji.", market)
+                continue
+
+            done = _done_tickers(market)
+            missing = [name for name in wanted if name not in done]
+            log.info(
+                "Trh %s: %d tickerů, hotových %d, ke stažení %d.",
+                market, len(wanted), len(wanted) - len(missing), len(missing),
+            )
+
+            for offset in range(0, len(missing), _TICKERS_BATCH):
+                batch = missing[offset:offset + _TICKERS_BATCH]
+                rows = []
+                for ticker_name in batch:
+                    try:
+                        details = _fetch(client, ticker_name)
+                    except _RestError as exc:
+                        log.error("%s — ticker přeskakuji.", exc)
+                        continue
+                    if details is not None:
+                        rows.append(_row(details))
+
+                if rows:
+                    # Nejdřív DB, pak part: když pád přijde mezi tím, příští běh
+                    # ticker stáhne znovu (jen ztráta jednoho dotazu), ale
+                    # o řádek v DB nepřijde.
+                    _upsert(con, rows)
+                    _write_part(market, batch[0], rows)
+
+                log.info(
+                    "[%s] %d/%d staženo (%d v dávce).",
+                    market, min(offset + _TICKERS_BATCH, len(missing)),
+                    len(missing), len(rows),
+                )
+
+            merged = _merge(market)
+            if merged:
+                log.info("Snapshot %s (%d tickerů).", merged[0], merged[1])
+        finally:
+            con.close()
 
 
 # Maximální počet záznamů, který REST API vrátí v jednom dotazu.
@@ -824,6 +1386,7 @@ def update_minute(cfg: AppConfig) -> None:
         """
         last_exc = None
         for attempt in range(1, cfg.retries + 1):
+            _throttle(cfg)
             try:
                 return _fetch_ticker(client, ticker, from_day, to_day)
             except Exception as exc:
@@ -836,6 +1399,8 @@ def update_minute(cfg: AppConfig) -> None:
                     attempt, cfg.retries, ticker, from_day, to_day, exc, wait,
                 )
                 time.sleep(wait)
+                if "429" in str(exc):
+                    _reset_rate_limit()   # API už nás zpomalilo, okno je vyčerpané
         raise _RestError(
             f"ticker {ticker} ({from_day}..{to_day}) se nepodařilo stáhnout: "
             f"{last_exc}"
@@ -925,8 +1490,6 @@ def update_minute(cfg: AppConfig) -> None:
                         len(by_day),
                     )
 
-                time.sleep(_REST_DELAY_SECONDS)
-
             # Úsek je hotový — teprve teď se zapisují denní soubory.
             for day in sorted(buffer):
                 dest = _write_day(market, day, buffer[day])
@@ -947,4 +1510,5 @@ if __name__ == "__main__":
     # update_flat_files(cfg, timeframe="1m")
     # Při subscription=False výše uvedené funkce nic nestahují a denní data
     # dotáhne REST; při subscription=True update_daily rovnou skončí.
+    update_tickers(cfg)
     update_daily(cfg)
